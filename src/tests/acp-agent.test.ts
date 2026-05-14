@@ -1533,6 +1533,7 @@ describe("stop reason propagation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
   }
 
@@ -1676,6 +1677,7 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
 
     const response = await agent.prompt({
@@ -1794,6 +1796,204 @@ describe("stop reason propagation", () => {
   });
 });
 
+describe("assistant text fallback when streaming yields no text deltas", () => {
+  function createCapturingAgent() {
+    const notifications: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        notifications.push(n);
+      },
+      extNotification: async () => {},
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, notifications };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
+    };
+  }
+
+  function makeResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function makeAssistantMessage(messageId: string, text: string) {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: messageId,
+        type: "message" as const,
+        role: "assistant" as const,
+        model: "claude-test",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    };
+  }
+
+  it("emits the assembled text when no content_block_delta was streamed", async () => {
+    const { agent, notifications } = createCapturingAgent();
+    const messageId = "msg_no_stream";
+    const finalText = "final answer never streamed";
+    injectSession(agent, [
+      makeAssistantMessage(messageId, finalText),
+      makeResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const textChunks = notifications
+      .map((n) => n.update)
+      .filter(
+        (u) =>
+          u.sessionUpdate === "agent_message_chunk" &&
+          u.content.type === "text" &&
+          u.content.text === finalText,
+      );
+    expect(textChunks.length).toBe(1);
+  });
+
+  it("does not re-emit text already streamed via content_block_delta", async () => {
+    const { agent, notifications } = createCapturingAgent();
+    const messageId = "msg_streamed";
+    const streamedText = "streamed answer";
+    injectSession(agent, [
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "message_start",
+          message: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            model: "claude-test",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: streamedText },
+        },
+      },
+      makeAssistantMessage(messageId, streamedText),
+      makeResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const textChunks = notifications
+      .map((n) => n.update)
+      .filter(
+        (u) =>
+          u.sessionUpdate === "agent_message_chunk" &&
+          u.content.type === "text" &&
+          u.content.text === streamedText,
+      );
+    // Only the streamed content_block_delta should produce a chunk; the
+    // assembled message must not duplicate it.
+    expect(textChunks.length).toBe(1);
+  });
+});
+
 describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
@@ -1834,6 +2034,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -1930,6 +2131,7 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2164,6 +2366,7 @@ describe("usage_update computation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
   }
 
@@ -3063,6 +3266,7 @@ describe("emitRawSDKMessages", () => {
       abortController: new AbortController(),
       emitRawSDKMessages,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
   }
 
@@ -3290,6 +3494,7 @@ describe("result origin handling", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      textStreamedMessageIds: new Set<string>(),
     };
   }
 
