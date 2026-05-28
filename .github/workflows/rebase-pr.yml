@@ -1,0 +1,115 @@
+name: Rebase PR + tag release
+
+# Manually triggered workflow that keeps a long-lived PR branch (upstream PR
+# candidate) rebased on top of upstream/main, and produces an installable
+# release tag whose tree contains the built `dist/` artifacts.
+#
+# Range of responsibility:
+#   - rebases `inputs.branch` onto `upstream/<inputs.upstream_ref>` (3-way merge)
+#   - runs `npm ci && npm run build && (optional) npm run test:run -- src/tests/acp-agent.test.ts`
+#   - force-pushes the rebased branch *without* the dist build commit (so the
+#     upstream PR stays clean)
+#   - on top of the rebased HEAD, creates an in-memory `build: dist for <tag>`
+#     commit and pushes only the resulting tag
+#
+# Deploy on devbox:
+#   sudo npm install -g git+ssh://git@github.com/LeoCui/claude-agent-acp.git#<tag>
+#
+# Required repo secret:
+#   REBASE_PAT — fine-grained PAT scoped to this repo with Contents R/W. The
+#   default GITHUB_TOKEN is not used because pushes signed by it do not
+#   trigger downstream PR CI checks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "PR branch to rebase (will be force-pushed without dist commit)"
+        required: true
+        default: "upstream-pr/fallback-text-from-assistant-message"
+      upstream_ref:
+        description: "Upstream ref to rebase onto (main / v0.37.0 / sha)"
+        required: true
+        default: "main"
+      tag:
+        description: "Tag to push on top of rebased branch + dist commit (e.g. v0.37.0-cuiyiming.leo95.1)"
+        required: true
+      run_tests:
+        description: "Run acp-agent.test.ts before push"
+        type: boolean
+        default: true
+
+jobs:
+  rebase-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.REBASE_PAT }}
+
+      - name: Configure git and add upstream remote
+        run: |
+          git config user.name "rebase-bot"
+          git config user.email "rebase-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git
+          git fetch upstream "${{ inputs.upstream_ref }}" --tags
+
+      - name: Show pre-rebase state
+        run: |
+          echo "=== Local HEAD ==="
+          git log -3 --oneline
+          echo "=== Upstream target (FETCH_HEAD) ==="
+          git log -3 --oneline FETCH_HEAD
+          echo "=== Commits that will be replayed ==="
+          git log --oneline FETCH_HEAD..HEAD || echo "(nothing to replay — already on upstream)"
+
+      - name: Rebase onto upstream
+        run: git rebase FETCH_HEAD
+
+      - name: Show post-rebase HEAD
+        run: git log -3 --oneline
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Run acp-agent.test.ts
+        if: ${{ inputs.run_tests }}
+        run: npm run test:run -- src/tests/acp-agent.test.ts
+
+      - name: Force-push clean PR branch (without dist commit)
+        run: git push origin HEAD:"${{ inputs.branch }}" --force-with-lease
+
+      - name: Create in-memory dist commit on top of rebased HEAD
+        run: |
+          # dist/ is .gitignore'd, force-add it for this commit
+          git add -f dist
+          git commit -m "build: dist for ${{ inputs.tag }}"
+
+      - name: Create + push annotated tag
+        run: |
+          git tag -a "${{ inputs.tag }}" -m "Release ${{ inputs.tag }} (rebased ${{ inputs.branch }} onto ${{ inputs.upstream_ref }})"
+          git push origin "${{ inputs.tag }}"
+
+      - name: Summary
+        run: |
+          echo "================================================================"
+          echo "Tag pushed:        ${{ inputs.tag }}"
+          echo "Branch updated:    ${{ inputs.branch }}"
+          echo "Rebased onto:      upstream/${{ inputs.upstream_ref }}"
+          echo ""
+          echo "Deploy command on devbox:"
+          echo "  sudo npm install -g git+ssh://git@github.com/LeoCui/claude-agent-acp.git#${{ inputs.tag }}"
+          echo "================================================================"
