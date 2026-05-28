@@ -190,11 +190,15 @@ jobs:
             REAL_BASE_DESC="unknown"
             OWN_COUNT="?"
           fi
+          # `Verify rebase invariant` already failed the run if the requested
+          # upstream ref didn't equal the real merge-base, so showing both
+          # `Requested target` and `Real rebased base` here would always be
+          # redundant duplicate lines. Collapse them into a single
+          # `Rebased onto:` row that describes the (verified-equal) base.
           echo "================================================================"
           echo "Tag pushed:        $FORK_REPO@${{ inputs.tag }}"
           echo "Branch updated:    $FORK_REPO:${{ inputs.branch }}  (force-pushed)"
-          echo "Requested target:  $UPSTREAM_REPO:${{ inputs.upstream_ref }}  (rebased onto)"
-          echo "Real rebased base: $UPSTREAM_REPO:$REAL_BASE_DESC  (commit $BASE_SHA)"
+          echo "Rebased onto:      $UPSTREAM_REPO:$REAL_BASE_DESC  (commit $BASE_SHA)"
           echo "Own commits:       $OWN_COUNT  (between base and the fix commit, dist commit excluded)"
           echo ""
           echo "Deploy command on devbox:"
