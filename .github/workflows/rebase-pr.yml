@@ -1,16 +1,26 @@
 name: Rebase PR + tag release
 
 # Manually triggered workflow that keeps a long-lived PR branch (upstream PR
-# candidate) rebased on top of upstream/main, and produces an installable
+# candidate) rebased onto a chosen upstream ref, and produces an installable
 # release tag whose tree contains the built `dist/` artifacts.
 #
 # Range of responsibility:
-#   - rebases `inputs.branch` onto `upstream/<inputs.upstream_ref>` (3-way merge)
+#   - rebases `inputs.branch` onto `upstream/<inputs.upstream_ref>` using
+#     `git rebase --onto FETCH_HEAD upstream/main HEAD` — only commits that
+#     are *not* on upstream/main get replayed, so the workflow does the right
+#     thing whether the target is upstream/main itself, an older release tag
+#     (e.g. `v0.37.0` while main is at v0.37.0+N), or a future release tag.
 #   - runs `npm ci && npm run build && (optional) npm run test:run -- src/tests/acp-agent.test.ts`
 #   - force-pushes the rebased branch *without* the dist build commit (so the
 #     upstream PR stays clean)
 #   - on top of the rebased HEAD, creates an in-memory `build: dist for <tag>`
 #     commit and pushes only the resulting tag
+#
+# Note on PR diff cleanliness: GitHub's PR "Files changed" uses three-dot
+# diff (`git diff base...head` = `git diff $(merge-base base head) head`),
+# so the PR diff is independent of how old the branch's base is — the upstream
+# PR view stays clean even when `upstream_ref` is a release tag older than
+# upstream/main.
 #
 # Deploy on devbox:
 #   sudo npm install -g git+ssh://git@github.com/LeoCui/claude-agent-acp.git#<tag>
@@ -28,11 +38,11 @@ on:
         required: true
         default: "upstream-pr/fallback-text-from-assistant-message"
       upstream_ref:
-        description: "Upstream ref to rebase onto (main / v0.37.0 / sha)"
+        description: "Upstream ref to rebase onto — lock to a release tag (e.g. v0.37.0) for deploys, or use main to sync with upstream HEAD"
         required: true
-        default: "main"
+        default: "v0.37.0"
       tag:
-        description: "Tag to push on top of rebased branch + dist commit (e.g. v0.37.0-cuiyiming.leo95.1)"
+        description: "Tag to push on top of rebased branch + dist commit (e.g. v0.37.0-cuiyiming.leo95.2)"
         required: true
       run_tests:
         description: "Run acp-agent.test.ts before push"
@@ -57,22 +67,41 @@ jobs:
           git config user.name "rebase-bot"
           git config user.email "rebase-bot@users.noreply.github.com"
           git remote add upstream https://github.com/agentclientprotocol/claude-agent-acp.git
-          git fetch upstream "${{ inputs.upstream_ref }}" --tags
+          # Always fetch upstream/main — `rebase --onto` uses it to identify
+          # which commits on the PR branch belong to the contributor (anything
+          # reachable from HEAD but not from upstream/main).
+          git fetch upstream main --tags
+          # Then fetch the chosen target ref. When `upstream_ref` is `main`,
+          # this is a no-op; otherwise FETCH_HEAD ends up pointing at the tag
+          # / sha we want to rebase onto.
+          git fetch upstream "${{ inputs.upstream_ref }}"
 
       - name: Show pre-rebase state
         run: |
-          echo "=== Local HEAD ==="
+          echo "=== PR branch HEAD ==="
           git log -3 --oneline
-          echo "=== Upstream target (FETCH_HEAD) ==="
+          echo "=== Target ref ($(git describe --tags --always FETCH_HEAD)) ==="
           git log -3 --oneline FETCH_HEAD
-          echo "=== Commits that will be replayed ==="
-          git log --oneline FETCH_HEAD..HEAD || echo "(nothing to replay — already on upstream)"
+          echo "=== upstream/main (used to identify own commits) ==="
+          git log -1 --oneline upstream/main
+          echo "=== Own commits to replay (upstream/main..HEAD) ==="
+          git log --oneline upstream/main..HEAD || echo "(none — branch already merged into upstream)"
 
-      - name: Rebase onto upstream
-        run: git rebase FETCH_HEAD
+      - name: Rebase own commits onto target ref
+        run: |
+          # Take "commits in HEAD not in upstream/main" (= the contributor's
+          # fix), replay them onto FETCH_HEAD (= inputs.upstream_ref). This
+          # works correctly whether the target is upstream/main itself, an
+          # older release tag, or a future one — upstream's own commits never
+          # tag along.
+          git rebase --onto FETCH_HEAD upstream/main HEAD
 
       - name: Show post-rebase HEAD
-        run: git log -3 --oneline
+        run: |
+          echo "=== HEAD after rebase ==="
+          git log -3 --oneline
+          echo "=== Real base of HEAD (git describe) ==="
+          git describe --tags --always HEAD~1 || true
 
       - uses: actions/setup-node@v4
         with:
@@ -105,10 +134,12 @@ jobs:
 
       - name: Summary
         run: |
+          REAL_BASE=$(git describe --tags --always HEAD~1 2>/dev/null || echo "unknown")
           echo "================================================================"
           echo "Tag pushed:        ${{ inputs.tag }}"
           echo "Branch updated:    ${{ inputs.branch }}"
-          echo "Rebased onto:      upstream/${{ inputs.upstream_ref }}"
+          echo "Requested target:  upstream/${{ inputs.upstream_ref }}"
+          echo "Real rebased base: $REAL_BASE"
           echo ""
           echo "Deploy command on devbox:"
           echo "  sudo npm install -g git+ssh://git@github.com/LeoCui/claude-agent-acp.git#${{ inputs.tag }}"
