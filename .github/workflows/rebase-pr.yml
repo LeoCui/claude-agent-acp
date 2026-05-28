@@ -78,13 +78,15 @@ jobs:
 
       - name: Show pre-rebase state
         run: |
-          echo "=== PR branch HEAD ==="
+          UPSTREAM_REPO="agentclientprotocol/claude-agent-acp"
+          FORK_REPO="${{ github.repository }}"
+          echo "=== PR branch HEAD ($FORK_REPO:${{ inputs.branch }}) ==="
           git log -3 --oneline
-          echo "=== Target ref ($(git describe --tags --always FETCH_HEAD)) ==="
+          echo "=== Target ref ($UPSTREAM_REPO:${{ inputs.upstream_ref }} → $(git describe --tags --always FETCH_HEAD)) ==="
           git log -3 --oneline FETCH_HEAD
-          echo "=== upstream/main (used to identify own commits) ==="
+          echo "=== $UPSTREAM_REPO:main (used to identify own commits) ==="
           git log -1 --oneline upstream/main
-          echo "=== Own commits to replay (upstream/main..HEAD) ==="
+          echo "=== Own commits to replay ($UPSTREAM_REPO:main..$FORK_REPO:${{ inputs.branch }}) ==="
           git log --oneline upstream/main..HEAD || echo "(none — branch already merged into upstream)"
 
       - name: Rebase own commits onto target ref
@@ -98,10 +100,18 @@ jobs:
 
       - name: Show post-rebase HEAD
         run: |
+          UPSTREAM_REPO="agentclientprotocol/claude-agent-acp"
           echo "=== HEAD after rebase ==="
           git log -3 --oneline
-          echo "=== Real base of HEAD (git describe) ==="
-          git describe --tags --always HEAD~1 || true
+          # Use merge-base instead of HEAD~N so this stays correct regardless
+          # of how many own commits the PR branch carries.
+          BASE_SHA=$(git merge-base HEAD upstream/main 2>/dev/null || echo "")
+          if [ -n "$BASE_SHA" ]; then
+            echo "=== Real upstream base ($UPSTREAM_REPO:$(git describe --tags --always "$BASE_SHA")) ==="
+            echo "  commit: $BASE_SHA"
+          else
+            echo "=== Real upstream base: unknown ==="
+          fi
 
       - uses: actions/setup-node@v4
         with:
@@ -134,13 +144,26 @@ jobs:
 
       - name: Summary
         run: |
-          REAL_BASE=$(git describe --tags --always HEAD~1 2>/dev/null || echo "unknown")
+          UPSTREAM_REPO="agentclientprotocol/claude-agent-acp"
+          FORK_REPO="${{ github.repository }}"
+          # Real base = merge-base with upstream/main. This works no matter how
+          # many own commits the PR branch carries or how many commits the
+          # workflow itself adds on top (e.g. the dist build commit).
+          BASE_SHA=$(git merge-base HEAD upstream/main 2>/dev/null || echo "")
+          if [ -n "$BASE_SHA" ]; then
+            REAL_BASE_DESC=$(git describe --tags --always "$BASE_SHA")
+            OWN_COUNT=$(git rev-list --count "$BASE_SHA..HEAD~1" 2>/dev/null || echo "?")
+          else
+            REAL_BASE_DESC="unknown"
+            OWN_COUNT="?"
+          fi
           echo "================================================================"
-          echo "Tag pushed:        ${{ inputs.tag }}"
-          echo "Branch updated:    ${{ inputs.branch }}"
-          echo "Requested target:  upstream/${{ inputs.upstream_ref }}"
-          echo "Real rebased base: $REAL_BASE"
+          echo "Tag pushed:        $FORK_REPO@${{ inputs.tag }}"
+          echo "Branch updated:    $FORK_REPO:${{ inputs.branch }}  (force-pushed)"
+          echo "Requested target:  $UPSTREAM_REPO:${{ inputs.upstream_ref }}  (rebased onto)"
+          echo "Real rebased base: $UPSTREAM_REPO:$REAL_BASE_DESC  (commit $BASE_SHA)"
+          echo "Own commits:       $OWN_COUNT  (between base and the fix commit, dist commit excluded)"
           echo ""
           echo "Deploy command on devbox:"
-          echo "  sudo npm install -g git+ssh://git@github.com/LeoCui/claude-agent-acp.git#${{ inputs.tag }}"
+          echo "  sudo npm install -g git+ssh://git@github.com/$FORK_REPO.git#${{ inputs.tag }}"
           echo "================================================================"
