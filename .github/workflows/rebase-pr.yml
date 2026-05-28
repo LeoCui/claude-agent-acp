@@ -113,6 +113,39 @@ jobs:
             echo "=== Real upstream base: unknown ==="
           fi
 
+      - name: Verify rebase invariant (requested target ≡ real rebased base)
+        run: |
+          # After `git rebase --onto FETCH_HEAD upstream/main HEAD`, the fix
+          # commit's parent must equal FETCH_HEAD, AND that commit must be on
+          # upstream/main's ancestry (so merge-base(HEAD, upstream/main) ==
+          # FETCH_HEAD). If these don't match it usually means inputs.upstream_ref
+          # points to a commit that is not on upstream/main's history (e.g. some
+          # forked branch on the upstream repo). Catching this here prevents
+          # downstream npm ci / build / test work from running on a base the
+          # workflow author did not request.
+          UPSTREAM_REPO="agentclientprotocol/claude-agent-acp"
+          REQUESTED_SHA=$(git rev-parse "FETCH_HEAD^{commit}")
+          ACTUAL_BASE_SHA=$(git merge-base HEAD upstream/main 2>/dev/null || echo "")
+          if [ -z "$ACTUAL_BASE_SHA" ]; then
+            echo "::error title=Rebase invariant violation::cannot compute merge-base with upstream/main"
+            exit 1
+          fi
+          if [ "$REQUESTED_SHA" != "$ACTUAL_BASE_SHA" ]; then
+            echo "::error title=Rebase invariant violation::real base does not match the requested upstream ref"
+            echo "  Requested:   $UPSTREAM_REPO:${{ inputs.upstream_ref }}"
+            echo "               → SHA $REQUESTED_SHA ($(git describe --tags --always $REQUESTED_SHA))"
+            echo "  Real base:   SHA $ACTUAL_BASE_SHA ($(git describe --tags --always $ACTUAL_BASE_SHA))"
+            echo ""
+            echo "Likely cause: inputs.upstream_ref points to a commit that is not on upstream/main's"
+            echo "history (e.g. an upstream branch that was never merged). The rebase landed the fix"
+            echo "on it, but merge-base resolves to an older common ancestor on main, so the produced"
+            echo "tag's effective base does not match what was requested."
+            echo ""
+            echo "Fix inputs.upstream_ref (must be reachable from upstream/main) and re-run."
+            exit 1
+          fi
+          echo "✓ rebase invariant holds: real base SHA matches requested upstream ref ($REQUESTED_SHA)"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
